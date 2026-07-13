@@ -881,14 +881,29 @@ bool patchDsAddtid(PatchContext &Ctx, size_t Idx) {
 static uint32_t applyTrampolinePatchesImpl(PatchContext &Ctx, size_t Idx) {
   StringRef Mnem(Ctx.Decoded[Idx].Mnemonic);
 
-  if (!getDs2AddrReplacement(Mnem).empty())
-    return patchDs2Addr(Ctx, Idx) ? 1 : 0;
+  // Per-rule sub-buckets nested under the "strat:trampoline" parent total
+  // (which the dispatcher in comgr-hotswap-b0a0.cpp records). Timed only at
+  // matching sites, so no cost is added scanning non-DS instructions.
+  if (!getDs2AddrReplacement(Mnem).empty()) {
+    const uint64_t T0 = profNowNs();
+    const uint32_t P = patchDs2Addr(Ctx, Idx) ? 1 : 0;
+    profRecord("strat:trampoline/ds_2addr", T0, P);
+    return P;
+  }
 
-  if (Mnem == "tensor_load_to_lds")
-    return patchTensorLoadToLds(Ctx, Idx) ? 1 : 0;
+  if (Mnem == "tensor_load_to_lds") {
+    const uint64_t T0 = profNowNs();
+    const uint32_t P = patchTensorLoadToLds(Ctx, Idx) ? 1 : 0;
+    profRecord("strat:trampoline/tensor_tdm", T0, P);
+    return P;
+  }
 
-  if (!getAddtidReplacement(Mnem).empty())
-    return patchDsAddtid(Ctx, Idx) ? 1 : 0;
+  if (!getAddtidReplacement(Mnem).empty()) {
+    const uint64_t T0 = profNowNs();
+    const uint32_t P = patchDsAddtid(Ctx, Idx) ? 1 : 0;
+    profRecord("strat:trampoline/addtid", T0, P);
+    return P;
+  }
 
   return 0;
 }

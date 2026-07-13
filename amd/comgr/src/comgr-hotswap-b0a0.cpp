@@ -34,12 +34,19 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cstdio>
 #include <limits>
+#include <mutex>
 
 using namespace llvm;
 
 namespace COMGR {
 namespace hotswap {
+
+// HotSwap rewrite profiling (opt-in via HOTSWAP_PROFILE) lives in
+// comgr-hotswap-internal.h so the sibling comgr-hotswap-patch-*.cpp TUs can
+// record per-rule timings into the same process-wide accumulator.
 
 // -- GFX1250 B0-to-A0 constants -----------------------------------------------
 //
@@ -332,6 +339,9 @@ buildNopSledMap(ArrayRef<InternalDecodedInst> Decoded, const uint8_t *Text,
     std::memcpy(Ctx.Text + InstOffset + I, LS.SNopBytes.data(), MinInstSize);
 
   Sled.WritePos += Replacement.size() + MinInstSize;
+  // Count-only row (0 ns): patch placed in-line via a nearby NOP sled with a
+  // short s_branch to/from it (no appended trampoline needed).
+  HotswapProfiler::get().record("jump:nop_sled", 0, 0);
   return true;
 }
 
@@ -407,15 +417,19 @@ SmallVector<uint8_t> encodeLongBranch(const LLVMState &LS, uint64_t FromOffset,
 
   if (Far) {
     if (InstSize < LongBranchFwdBytes) {
+      // Count-only rows (0 ns): the "calls" column is the number of sites.
+      HotswapProfiler::get().record("jump:declined_far", 0, 0);
       log() << "hotswap: long trampoline: site 0x" << utohexstr(InstOffset)
             << " is " << InstSize << " B < " << LongBranchFwdBytes
             << " B forward branch; declining (site left unpatched)\n";
       return false;
     }
     T.Long = true;
+    HotswapProfiler::get().record("jump:far_long_s_add_pc", 0, 0);
     // Reserve the long branch-back slot (worst-case 64-bit-literal size).
     T.Bytes.insert(T.Bytes.end(), LongBranchMaxBytes, uint8_t{0});
   } else {
+    HotswapProfiler::get().record("jump:short_s_branch", 0, 0);
     // Reserve the short branch-back slot; fixupTrampolineBranches fills it in.
     T.Bytes.insert(T.Bytes.end(), MinInstSize, uint8_t{0});
   }
@@ -469,13 +483,22 @@ applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
                         std::vector<Trampoline> &OutTrampolines, ElfView &Elf,
                         std::vector<ScratchPatchInfo> &OutScratchPatches,
                         const RewriteConfig &Config) {
+  const bool Prof = HotswapProfiler::get().enabled();
   uint32_t Patched = 0;
+
+  uint64_t SledT0 = profNowNs();
   std::vector<NopSled> Sleds =
       buildNopSledMap(Decoded, Text, TextSize, LS, Elf);
+  profRecord("b0a0:nop_sled_scan", SledT0);
 
+  uint64_t CfgT0 = profNowNs();
   CFG Cfg = buildCfg(Decoded, *LS.MCII);
+  profRecord("b0a0:cfg_build", CfgT0);
+
+  uint64_t LiveT0 = profNowNs();
   LivenessInfo Liveness =
       computeLiveness(Decoded, Cfg, *LS.MCII, *LS.MRI, Config.MaxVgprs);
+  profRecord("b0a0:liveness", LiveT0);
 
   if (!Liveness.Converged) {
     log() << "hotswap: error: liveness analysis did not converge, using "
@@ -495,6 +518,30 @@ applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
 
   const HotswapPatchVTable &VT = getHotswapPatchVTable();
 
+  // Per-strategy time/patch accumulators for the per-instruction passes.
+  // Summed locally across the whole instruction stream (no locking on the hot
+  // path) and flushed once to the profiler after the loop. Only touched when
+  // profiling is enabled.
+  struct StratAccum {
+    uint64_t Nanos = 0;
+    uint64_t Patches = 0;
+  };
+  StratAccum InPlaceAcc, TrampAcc, WmmaSplitAcc, ScratchAcc, WmmaScale16Acc;
+
+  // Run one per-instruction pass, charging its wall time + patch count to
+  // \p Acc when profiling. When profiling is off this is exactly
+  // runPerInstPass (a single indirect call, no timing overhead).
+  auto timedPass = [&](StratAccum &Acc, uint32_t (*Fn)(PatchContext &, size_t),
+                       size_t I) -> uint32_t {
+    if (!Prof)
+      return runPerInstPass(Fn, Ctx, I);
+    const uint64_t T0 = profNowNs();
+    const uint32_t P = runPerInstPass(Fn, Ctx, I);
+    Acc.Nanos += profNowNs() - T0;
+    Acc.Patches += P;
+    return P;
+  };
+
   // Skip undecoded slots produced by the decoder for bytes it could not
   // classify as a valid instruction; the dispatcher has nothing to match
   // against on these and we must not invoke the patch passes for them.
@@ -505,26 +552,37 @@ applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
     if (DI.Mnemonic == UnknownMnemonic)
       continue;
 
-    if (uint32_t P = runPerInstPass(VT.applyInPlacePatches, Ctx, Idx)) {
+    if (uint32_t P = timedPass(InPlaceAcc, VT.applyInPlacePatches, Idx)) {
       Patched += P;
       continue;
     }
-    if (uint32_t P = runPerInstPass(VT.applyTrampolinePatches, Ctx, Idx)) {
+    if (uint32_t P = timedPass(TrampAcc, VT.applyTrampolinePatches, Idx)) {
       Patched += P;
       continue;
     }
-    if (uint32_t P = runPerInstPass(VT.applyWmmaSplitPatches, Ctx, Idx)) {
+    if (uint32_t P = timedPass(WmmaSplitAcc, VT.applyWmmaSplitPatches, Idx)) {
       Patched += P;
       continue;
     }
-    if (uint32_t P = runPerInstPass(VT.applyScratchPatches, Ctx, Idx)) {
+    if (uint32_t P = timedPass(ScratchAcc, VT.applyScratchPatches, Idx)) {
       Patched += P;
       continue;
     }
-    if (uint32_t P = runPerInstPass(VT.applyWmmaScale16Patches, Ctx, Idx)) {
+    if (uint32_t P =
+            timedPass(WmmaScale16Acc, VT.applyWmmaScale16Patches, Idx)) {
       Patched += P;
       continue;
     }
+  }
+
+  if (Prof) {
+    HotswapProfiler &P = HotswapProfiler::get();
+    P.record("strat:inplace_s_clause", InPlaceAcc.Nanos, InPlaceAcc.Patches);
+    P.record("strat:trampoline", TrampAcc.Nanos, TrampAcc.Patches);
+    P.record("strat:wmma_split", WmmaSplitAcc.Nanos, WmmaSplitAcc.Patches);
+    P.record("strat:scratch_fp8", ScratchAcc.Nanos, ScratchAcc.Patches);
+    P.record("strat:wmma_scale16", WmmaScale16Acc.Nanos,
+             WmmaScale16Acc.Patches);
   }
 
   // Whole-kernel passes below run after per-instruction patches. Earlier
@@ -538,10 +596,18 @@ applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
   //    treat a branch as WMMA/VALU/VOP3PX2.
   // If a future patch family changes instruction boundaries, the Decoded
   // stream must be rebuilt before these passes run.
-  if (VT.applyWmmaHazardPatch)
-    Patched += VT.applyWmmaHazardPatch(Ctx);
-  if (VT.applyVop3px2Src2Fix)
-    Patched += VT.applyVop3px2Src2Fix(Ctx);
+  if (VT.applyWmmaHazardPatch) {
+    const uint64_t T0 = profNowNs();
+    const uint32_t P = VT.applyWmmaHazardPatch(Ctx);
+    profRecord("strat:wmma_hazard", T0, P);
+    Patched += P;
+  }
+  if (VT.applyVop3px2Src2Fix) {
+    const uint64_t T0 = profNowNs();
+    const uint32_t P = VT.applyVop3px2Src2Fix(Ctx);
+    profRecord("strat:vop3px2_src2", T0, P);
+    Patched += P;
+  }
 
   for (const llvm::StringMapEntry<KernelPatchStats> &KV : KernelStats) {
     StringRef KName = KV.first();
@@ -732,11 +798,16 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
     return AMD_COMGR_STATUS_SUCCESS;
   }
 
+  // Wall time of the whole rewrite (one row = one code object rewritten),
+  // recorded on every return path via RAII.
+  ScopedProf TotalProf("phase:rewrite_total");
+
   // Take a working copy so the input is preserved and we have a mutable
   // buffer to parse / patch.
   std::vector<uint8_t> Buf(static_cast<const uint8_t *>(ElfData),
                            static_cast<const uint8_t *>(ElfData) + ElfSize);
 
+  uint64_t ParseT0 = profNowNs();
   Expected<ElfView> ViewOrErr = ElfView::create(Buf.data(), Buf.size());
   if (!ViewOrErr) {
     log() << "hotswap: error: retargetCodeObject: input is not a "
@@ -749,8 +820,11 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
     return AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT;
   }
   ElfView &Elf = *ViewOrErr;
+  profRecord("phase:elf_parse", ParseT0);
 
+  uint64_t InitT0 = profNowNs();
   LLVMState LS = initLLVM(TargetIdent);
+  profRecord("phase:initLLVM", InitT0);
   if (!LS.Valid) {
     log() << "hotswap: error: retargetCodeObject: initLLVM failed "
           << "for CPU '" << TargetIdent.Processor << "'; aborting rewrite.\n";
@@ -765,15 +839,20 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
   std::vector<ScratchPatchInfo> ScratchPatches;
   if (Options.RunB0A0Patches) {
     std::vector<InternalDecodedInst> Decoded;
-    if (!decodeTextSection(Text, Elf.textSize(), LS, Decoded)) {
+    uint64_t DecodeT0 = profNowNs();
+    bool Decoded_ok = decodeTextSection(Text, Elf.textSize(), LS, Decoded);
+    profRecord("phase:decode", DecodeT0);
+    if (!Decoded_ok) {
       log() << "hotswap: error: retargetCodeObject: decodeTextSection "
             << "failed on .text (" << Elf.textSize() << " bytes).\n";
       return AMD_COMGR_STATUS_ERROR;
     }
 
+    uint64_t DispatchT0 = profNowNs();
     std::optional<uint32_t> Patched =
         applyGfx1250B0toA0Rules(Decoded, Text, Elf.textSize(), LS, Deferred,
                                 Elf, ScratchPatches, Config);
+    profRecord("phase:b0a0_dispatch", DispatchT0);
     if (!Patched)
       return AMD_COMGR_STATUS_ERROR;
     Count = *Patched;
@@ -785,7 +864,10 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
   std::unique_ptr<WritableMemoryBuffer> Result;
   std::vector<Trampoline> Growth = Deferred;
   if (!Deferred.empty()) {
-    if (!fixupTrampolineBranches(Deferred, Text, Elf.textSize(), LS)) {
+    uint64_t FixupT0 = profNowNs();
+    bool FixupOk = fixupTrampolineBranches(Deferred, Text, Elf.textSize(), LS);
+    profRecord("phase:fixup_trampolines", FixupT0);
+    if (!FixupOk) {
       // A trampoline branch could not be encoded, so the local `Buf` copy
       // is half-redirected; shipping it would run corrupted code. Fall back
       // to the pristine input object (`ElfData`, untouched) so the loader
@@ -813,8 +895,11 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
 
   std::vector<KernelEntryTrampolineFixup> EntryFixups;
   if (Options.RunEntryTrampolines) {
+    uint64_t EntryT0 = profNowNs();
     std::optional<uint32_t> EntryCount = appendKernelEntryTrampolines(
         Elf, LS, Config.MaxSgprs, Growth, EntryFixups);
+    profRecord("phase:entry_trampolines", EntryT0,
+               EntryCount.value_or(0));
     if (!EntryCount)
       return AMD_COMGR_STATUS_ERROR;
     Count += *EntryCount;
@@ -823,7 +908,9 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
   }
 
   if (!Growth.empty()) {
+    uint64_t GrowT0 = profNowNs();
     Result = Elf.growWithTrampolines(Growth, LS.SNopBytes);
+    profRecord("phase:grow_elf", GrowT0);
     if (!Result) {
       log() << "hotswap: error: retargetCodeObject: "
             << "ElfView::growWithTrampolines returned null with "
@@ -840,9 +927,15 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
       }
       GrowthTotal += T.Bytes.size();
     }
+    uint64_t DbgT0 = profNowNs();
     patchDebugSections(*Result, Deferred, Elf, GrowthTotal);
-    if (!rewriteKernelEntryDescriptorOffsets(*Result, Elf.textSize(),
-                                             EntryFixups))
+    profRecord("phase:debug_sections", DbgT0);
+
+    uint64_t KdT0 = profNowNs();
+    bool KdOk = rewriteKernelEntryDescriptorOffsets(*Result, Elf.textSize(),
+                                                    EntryFixups);
+    profRecord("phase:kd_rewrite", KdT0);
+    if (!KdOk)
       return AMD_COMGR_STATUS_ERROR;
   } else {
     Result = copyOutputBuffer(Buf.data(), ElfSize, "patched");
@@ -850,8 +943,11 @@ amd_comgr_status_t retargetCodeObject(const void *ElfData, size_t ElfSize,
       return AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES;
   }
 
-  if (!ScratchPatches.empty())
+  if (!ScratchPatches.empty()) {
+    uint64_t VerifyT0 = profNowNs();
     runScratchVerification(*Result, LS, ScratchPatches, Config.MaxVgprs);
+    profRecord("phase:scratch_verify", VerifyT0);
+  }
 
   Out = std::move(Result);
   return AMD_COMGR_STATUS_SUCCESS;

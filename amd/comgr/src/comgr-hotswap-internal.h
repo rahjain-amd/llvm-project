@@ -23,9 +23,15 @@
 #include "comgr-env.h"
 #include "comgr.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -83,6 +89,158 @@ inline std::optional<uint64_t> checkedAddUint64(uint64_t LHS, uint64_t RHS,
   log() << "hotswap: error: " << Context << " overflows uint64_t.\n";
   return std::nullopt;
 }
+
+// -- HotSwap rewrite profiling (opt-in via HOTSWAP_PROFILE) -------------------
+//
+// Wall-clock timing for the B0-to-A0 rewrite pipeline, aggregated across every
+// code object rewritten in the process and dumped to stderr at process exit.
+// Entirely opt-in: when HOTSWAP_PROFILE is unset (or "0") every hook is a
+// no-op. Lives here (not file-local to comgr-hotswap-b0a0.cpp) so the sibling
+// comgr-hotswap-patch-*.cpp TUs can record their own per-rule sub-buckets into
+// the same process-wide accumulator.
+//
+// Row families:
+//   phase:*  coarse pipeline stages in retargetCodeObject (initLLVM, decode,
+//            b0a0_dispatch, entry_trampolines, grow_elf, ...). Non-overlapping;
+//            b0a0_dispatch is a superset of the strat:* rows.
+//   strat:*  the B0-to-A0 patch strategies (inplace/s_clause, trampoline,
+//            wmma_*, scratch, ...). A strategy with sub-operations reports a
+//            parent total plus indented children named "strat:<pass>/<op>"
+//            (e.g. strat:trampoline/ds_2addr, .../tensor_tdm, .../addtid).
+//   jump:*   trampoline placement outcomes (nop_sled, short_s_branch,
+//            far_long_s_add_pc, declined_far); the "calls" column is the count.
+//
+// Names use '/' to denote one level of nesting; dump() prints each child
+// indented under its parent.
+
+inline uint64_t profNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+class HotswapProfiler {
+public:
+  static HotswapProfiler &get() {
+    static HotswapProfiler Instance;
+    return Instance;
+  }
+
+  bool enabled() const { return Enabled; }
+
+  void record(llvm::StringRef Name, uint64_t Nanos, uint64_t Patches) {
+    if (!Enabled)
+      return;
+    std::scoped_lock Lock(Mtx);
+    llvm::StringMapEntry<size_t> &Slot =
+        *Index.try_emplace(Name, Entries.size()).first;
+    if (Slot.second == Entries.size()) {
+      Order.emplace_back(Name.str());
+      Entries.emplace_back();
+    }
+    Entry &E = Entries[Slot.second];
+    E.TotalNanos += Nanos;
+    E.Calls += 1;
+    E.Patches += Patches;
+    E.MinNanos = std::min(E.MinNanos, Nanos);
+    E.MaxNanos = std::max(E.MaxNanos, Nanos);
+  }
+
+  ~HotswapProfiler() { dump(); }
+
+private:
+  struct Entry {
+    uint64_t TotalNanos = 0;
+    uint64_t Calls = 0;
+    uint64_t Patches = 0;
+    uint64_t MinNanos = std::numeric_limits<uint64_t>::max();
+    uint64_t MaxNanos = 0;
+  };
+
+  HotswapProfiler() {
+    const char *V = getenv("HOTSWAP_PROFILE");
+    Enabled = V && V[0] != '\0' && llvm::StringRef(V) != "0";
+  }
+
+  void printRow(llvm::StringRef Display, const Entry &E, unsigned Indent) {
+    std::string Label = std::string(Indent * 2, ' ') + Display.str();
+    const double TotalUs = E.TotalNanos / 1000.0;
+    const double AvgUs = E.Calls ? TotalUs / E.Calls : 0.0;
+    const double MinUs = E.MinNanos == std::numeric_limits<uint64_t>::max()
+                             ? 0.0
+                             : E.MinNanos / 1000.0;
+    const double MaxUs = E.MaxNanos / 1000.0;
+    fprintf(stderr, "%-28s %8llu %12.1f %11.3f %11.3f %11.3f %9llu\n",
+            Label.c_str(), static_cast<unsigned long long>(E.Calls), TotalUs,
+            AvgUs, MinUs, MaxUs, static_cast<unsigned long long>(E.Patches));
+  }
+
+  void dump() {
+    if (!Enabled || Entries.empty())
+      return;
+    fprintf(stderr,
+            "\n=== HotSwap COMGR rewrite profile (HOTSWAP_PROFILE) ===\n");
+    fprintf(stderr, "%-28s %8s %12s %11s %11s %11s %9s\n", "name", "calls",
+            "total_us", "avg_us", "min_us", "max_us", "patches");
+    std::vector<bool> Printed(Order.size(), false);
+    // Top-level rows first, each immediately followed by its "parent/child"
+    // rows indented one level.
+    for (size_t I = 0; I < Order.size(); ++I) {
+      if (Printed[I] || Order[I].find('/') != std::string::npos)
+        continue;
+      printRow(Order[I], Entries[I], 0);
+      Printed[I] = true;
+      const std::string Prefix = Order[I] + "/";
+      for (size_t J = 0; J < Order.size(); ++J) {
+        if (Printed[J] || Order[J].rfind(Prefix, 0) != 0)
+          continue;
+        printRow(llvm::StringRef(Order[J]).substr(Prefix.size()), Entries[J],
+                 1);
+        Printed[J] = true;
+      }
+    }
+    // Any child whose parent was never recorded as a top-level row.
+    for (size_t I = 0; I < Order.size(); ++I)
+      if (!Printed[I])
+        printRow(Order[I], Entries[I], 0);
+    fprintf(stderr,
+            "======================================================\n");
+  }
+
+  bool Enabled = false;
+  std::mutex Mtx;
+  std::vector<std::string> Order;
+  std::vector<Entry> Entries;
+  llvm::StringMap<size_t> Index;
+};
+
+/// Record the elapsed time since \p StartNs under \p Name (one invocation).
+inline void profRecord(llvm::StringRef Name, uint64_t StartNs,
+                       uint64_t Patches = 0) {
+  HotswapProfiler &P = HotswapProfiler::get();
+  if (P.enabled())
+    P.record(Name, profNowNs() - StartNs, Patches);
+}
+
+/// RAII wall-clock recorder: times the enclosing scope (including all early
+/// returns) and records it under \p Name on destruction.
+class ScopedProf {
+public:
+  explicit ScopedProf(llvm::StringRef Name)
+      : Name(Name),
+        StartNs(HotswapProfiler::get().enabled() ? profNowNs() : 0) {}
+  ScopedProf(const ScopedProf &) = delete;
+  ScopedProf &operator=(const ScopedProf &) = delete;
+  ~ScopedProf() {
+    HotswapProfiler &P = HotswapProfiler::get();
+    if (P.enabled())
+      P.record(Name, profNowNs() - StartNs, 0);
+  }
+
+private:
+  llvm::StringRef Name;
+  uint64_t StartNs;
+};
 
 // -- Trampoline and NOP sled --------------------------------------------------
 
