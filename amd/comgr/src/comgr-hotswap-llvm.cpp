@@ -21,6 +21,7 @@
 #include "comgr-hotswap-internal.h"
 #include "comgr.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCParser/MCAsmParser.h"
@@ -36,6 +37,112 @@ namespace COMGR {
 namespace hotswap {
 
 static constexpr StringLiteral UnknownMnemonic("<unknown>");
+
+namespace {
+// -- Decode-repetition measurement (opt-in via HOTSWAP_PROFILE) ---------------
+//
+// Quantifies the caching *ceiling* for instruction decode: how many of the
+// decoded instructions are byte-identical (and therefore would be cache hits).
+// Aggregated across every code object decoded in the process and dumped once at
+// exit. Keys are the exact consumed bytes (up to 8) paired with the decoded
+// size, so distinct encodings never collide.
+//   total insts          : every instruction decoded (== getInstruction calls)
+//   global unique         : unique encodings across ALL objects
+//                           -> process-wide cache would run getInstruction this
+//                              many times; hits = total - global_unique
+//   sum per-object unique : unique encodings counted per object then summed
+//                           -> per-object (no cross-load) cache ceiling;
+//                              cross-object sharing = sum_per_object - global
+#ifdef ENABLE_HOTSWAP_PROFILE
+class DecodeStats {
+public:
+  static DecodeStats &get() {
+    static DecodeStats Instance;
+    return Instance;
+  }
+  bool enabled() const { return Enabled; }
+
+  void addObject(uint64_t Total,
+                 const DenseSet<std::pair<uint64_t, unsigned>> &LocalKeys) {
+    if (!Enabled)
+      return;
+    std::scoped_lock Lock(Mtx);
+    TotalInsts += Total;
+    PerObjUnique += LocalKeys.size();
+    ++Objects;
+    for (const auto &K : LocalKeys)
+      GlobalKeys.insert(K);
+  }
+
+  ~DecodeStats() { dump(); }
+
+private:
+  DecodeStats() {
+    const char *V = getenv("HOTSWAP_PROFILE");
+    Enabled = V && V[0] != '\0' && StringRef(V) != "0";
+  }
+  void dump() {
+    if (!Enabled || TotalInsts == 0)
+      return;
+    const uint64_t GlobalUniq = GlobalKeys.size();
+    auto pct = [](uint64_t part, uint64_t whole) {
+      return whole ? 100.0 * double(part) / double(whole) : 0.0;
+    };
+    fprintf(stderr,
+            "\n=== HotSwap decode-repetition ceiling (HOTSWAP_PROFILE) ===\n");
+    fprintf(stderr, "objects decoded          : %llu\n",
+            (unsigned long long)Objects);
+    fprintf(stderr, "total insts (decodes)    : %llu\n",
+            (unsigned long long)TotalInsts);
+    fprintf(stderr,
+            "global unique encodings  : %llu  (process-wide cache: "
+            "%.1f%% hits, decodes %llu->%llu)\n",
+            (unsigned long long)GlobalUniq, pct(TotalInsts - GlobalUniq, TotalInsts),
+            (unsigned long long)TotalInsts, (unsigned long long)GlobalUniq);
+    fprintf(stderr,
+            "sum per-object unique    : %llu  (per-object cache: %.1f%% hits)\n",
+            (unsigned long long)PerObjUnique,
+            pct(TotalInsts - PerObjUnique, TotalInsts));
+    fprintf(stderr,
+            "cross-object shared      : %llu  (extra hits a process-wide cache "
+            "gets over per-object)\n",
+            (unsigned long long)(PerObjUnique - GlobalUniq));
+    fprintf(stderr,
+            "==========================================================\n");
+  }
+
+  bool Enabled = false;
+  std::mutex Mtx;
+  uint64_t TotalInsts = 0;
+  uint64_t PerObjUnique = 0;
+  uint64_t Objects = 0;
+  DenseSet<std::pair<uint64_t, unsigned>> GlobalKeys;
+};
+#else
+// Decode-repetition profiling compiled out; no-op stub keeps decodeTextSection
+// call sites valid at zero cost (enabled() is always false so the Stats-guarded
+// branches are dead-code eliminated).
+class DecodeStats {
+public:
+  static DecodeStats &get() {
+    static DecodeStats Instance;
+    return Instance;
+  }
+  bool enabled() const { return false; }
+  void addObject(uint64_t, const DenseSet<std::pair<uint64_t, unsigned>> &) {}
+};
+#endif
+
+/// Whether the per-call instruction decode cache is enabled (HOTSWAP_DECODE_CACHE
+/// set and not "0"). Evaluated once per process.
+bool isDecodeCacheEnabled() {
+  static const bool Enabled = [] {
+    const char *V = getenv("HOTSWAP_DECODE_CACHE");
+    return V && V[0] != '\0' && StringRef(V) != "0";
+  }();
+  return Enabled;
+}
+} // namespace
 
 namespace {
 // The amdgcn Target is the same for every AMDGPU subtarget (the per-CPU /
@@ -394,14 +501,69 @@ bool decodeTextSection(const uint8_t *Text, uint64_t TextSize,
                        std::vector<InternalDecodedInst> &Decoded) {
   Decoded.reserve(Decoded.size() + TextSize / MinInstSize);
   uint64_t Pos = 0;
+  // Fine-grained decode breakdown (opt-in via HOTSWAP_PROFILE): split the two
+  // per-instruction costs -- core MCDisassembler decode vs mnemonic printing +
+  // std::string materialization -- accumulated locally and recorded once at the
+  // end so the hot loop stays lock-free. Reported nested under phase:decode.
+  const bool Prof = HotswapProfiler::get().enabled();
+  // Only measure repetition on real kernel .text (skip the tiny 1-instruction
+  // resolveOpcode / entry-stub decodes that would pollute the object count).
+  const bool Stats = DecodeStats::get().enabled() && TextSize >= 1024;
+  // Per-call instruction decode cache (opt-in via HOTSWAP_DECODE_CACHE). Decode
+  // is a pure function of the instruction bytes, so byte-identical instructions
+  // (~87% of .text, almost all intra-object) reuse the first decode instead of
+  // re-running the MCDisassembler decision walk. Position-specific data lives in
+  // DI.Offset (set per occurrence), never in the cached MCInst, so reuse is
+  // safe. Keyed on the up-to-8-byte instruction window: a shared key implies
+  // identical decode; an over-specific key only costs a (correct) miss.
+  const bool Cache = isDecodeCacheEnabled();
+  struct DecodeCacheEntry {
+    MCInst Inst;
+    uint32_t Size;
+    std::string Mnemonic;
+  };
+  DenseMap<uint64_t, DecodeCacheEntry> LocalCache;
+  DenseSet<std::pair<uint64_t, unsigned>> LocalKeys;
+  uint64_t GetInstNs = 0, MnemonicNs = 0, CopyNs = 0, InstCount = 0,
+           HitCount = 0;
   while (Pos < TextSize) {
     InternalDecodedInst DI;
     DI.Offset = Pos;
 
+    uint64_t Key = 0;
+    unsigned KeyN = static_cast<unsigned>(std::min<uint64_t>(8, TextSize - Pos));
+    memcpy(&Key, Text + Pos, KeyN);
+
+    if (Cache) {
+      uint64_t CpT0 = Prof ? profNowNs() : 0;
+      DenseMap<uint64_t, DecodeCacheEntry>::iterator It = LocalCache.find(Key);
+      if (It != LocalCache.end()) {
+        DI.Size = It->second.Size;
+        DI.Inst = It->second.Inst;
+        DI.Mnemonic = It->second.Mnemonic;
+        if (Prof)
+          CopyNs += profNowNs() - CpT0;
+        if (Stats) {
+          uint64_t N = std::min<uint64_t>(DI.Size, TextSize - Pos);
+          uint64_t Packed = 0;
+          memcpy(&Packed, Text + Pos, N > 8 ? 8 : N);
+          LocalKeys.insert({Packed, DI.Size});
+        }
+        Pos += DI.Size;
+        ++InstCount;
+        ++HitCount;
+        Decoded.emplace_back(std::move(DI));
+        continue;
+      }
+    }
+
     ArrayRef<uint8_t> Bytes(Text + Pos, TextSize - Pos);
     uint64_t InstSize = 0;
+    uint64_t GiT0 = Prof ? profNowNs() : 0;
     MCDisassembler::DecodeStatus Status =
         S.MCD->getInstruction(DI.Inst, InstSize, Bytes, Pos, nulls());
+    if (Prof)
+      GetInstNs += profNowNs() - GiT0;
 
     if (Status == MCDisassembler::Fail) {
       DI.Size = MinInstSize;
@@ -413,6 +575,7 @@ bool decodeTextSection(const uint8_t *Text, uint64_t TextSize,
       // baked into AsmStrs must be trimmed. If the printer cannot provide an
       // assembly mnemonic, leave the instruction unmatchable instead of falling
       // back to TableGen opcode names.
+      uint64_t MnT0 = Prof ? profNowNs() : 0;
       if (S.MCIP) {
         std::pair<const char *, uint64_t> Mnem = S.MCIP->getMnemonic(DI.Inst);
         DI.Mnemonic = Mnem.first ? StringRef(Mnem.first).rtrim().str()
@@ -420,10 +583,37 @@ bool decodeTextSection(const uint8_t *Text, uint64_t TextSize,
       } else {
         DI.Mnemonic = UnknownMnemonic.str();
       }
+      if (Prof)
+        MnemonicNs += profNowNs() - MnT0;
+    }
+    // Only cache clean 4/8-byte decodes whose key fully covers the instruction
+    // (KeyN >= Size); a truncated tail key could alias a shorter instruction.
+    if (Cache && Status != MCDisassembler::Fail && DI.Size <= KeyN)
+      LocalCache.try_emplace(Key,
+                             DecodeCacheEntry{DI.Inst, DI.Size, DI.Mnemonic});
+    if (Stats) {
+      uint64_t N = std::min<uint64_t>(DI.Size, TextSize - Pos);
+      if (N > 8)
+        N = 8;
+      uint64_t Packed = 0;
+      memcpy(&Packed, Text + Pos, N);
+      LocalKeys.insert({Packed, DI.Size});
     }
     Pos += DI.Size;
+    ++InstCount;
     Decoded.emplace_back(std::move(DI));
   }
+  if (Prof) {
+    HotswapProfiler &P = HotswapProfiler::get();
+    P.record("phase:decode/getInstruction", GetInstNs, InstCount - HitCount);
+    P.record("phase:decode/mnemonic", MnemonicNs, InstCount);
+    if (Cache) {
+      P.record("phase:decode/cache_copy", CopyNs, HitCount);
+      P.record("phase:decode/cache_hit", 0, HitCount);
+    }
+  }
+  if (Stats)
+    DecodeStats::get().addObject(InstCount, LocalKeys);
   return true;
 }
 
