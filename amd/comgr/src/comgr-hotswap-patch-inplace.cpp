@@ -460,7 +460,8 @@ void analyzeKernelRange(ArrayRef<InternalDecodedInst> Decoded,
       Result.MustHavePriorVmem.reset(GlobalIdx);
     }
   };
-  if (Decoded[GlobalIndices.front()].Offset != Range.Begin) {
+  if (Decoded[GlobalIndices.front()].Offset != Range.Begin ||
+      Range.HasArbitraryIndirectIngress) {
     MergeConservativeRange();
     return;
   }
@@ -471,14 +472,17 @@ void analyzeKernelRange(ArrayRef<InternalDecodedInst> Decoded,
     OffsetToLocal.try_emplace(Decoded[GlobalIndices[I]].Offset, I);
 
   BitVector EntryNodes(Count);
-  EntryNodes.set(0);
-  for (uint64_t Entry : Range.AdditionalEntries) {
+  for (uint64_t Entry : Range.Entries) {
     auto It = OffsetToLocal.find(Entry);
     if (It == OffsetToLocal.end()) {
       MergeConservativeRange();
       return;
     }
     EntryNodes.set(It->second);
+  }
+  if (EntryNodes.none()) {
+    MergeConservativeRange();
+    return;
   }
 
   std::vector<SmallVector<unsigned, 2>> Successors(Count);
@@ -711,7 +715,10 @@ void analyzeKernelRange(ArrayRef<InternalDecodedInst> Decoded,
         Result.MustHavePriorVmem.reset(GlobalIdx);
     } else {
       Result.Reachable.set(GlobalIdx);
-      Result.MustHavePriorVmem.set(GlobalIdx, MustIn[I]);
+      if (MustIn[I])
+        Result.MustHavePriorVmem.set(GlobalIdx);
+      else
+        Result.MustHavePriorVmem.reset(GlobalIdx);
     }
   }
 }

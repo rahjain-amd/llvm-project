@@ -8,7 +8,8 @@ rewrite applied. The input code object is not modified.
 Input code objects must obey the AMDGPU callable-control-flow ABI. In
 particular, `s_swap_pc_i64` writing the standard link pair `s[30:31]` must be a
 call to a callable function entry represented by the code object. Using that
-ABI call form for an arbitrary interior transfer is unsupported.
+ABI call form for an arbitrary interior transfer is unsupported and may produce
+invalid rewritten code.
 
 This directory contains COMGR's hotswap transpiler scaffolding, the raiser-based
 path for heavier cross-ISA transformations. The same-family stepping patches and

@@ -2942,6 +2942,11 @@ amd_comgr_map_elf_virtual_address_to_code_object_offset(
  * function entry represented by the code object. Using that ABI call form for
  * an arbitrary interior transfer is unsupported and may produce invalid
  * rewritten code.
+ *
+ * HotSwap assumes the input was produced by a trusted compiler or an earlier
+ * trusted HotSwap invocation. Structural provenance notes written by HotSwap
+ * describe generated layout and rewrite state; they do not authenticate an
+ * otherwise untrusted code object.
  */
 
 /**

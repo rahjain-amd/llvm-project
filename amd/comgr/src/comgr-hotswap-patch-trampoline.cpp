@@ -1722,10 +1722,6 @@ void commitScratchVgpr(PatchContext &Ctx, const ScratchAlloc &Alloc) {
 // (no KD bump needed), so unlike VGPRs this needs no liveness. Same strategy
 // the E5M3 patch uses.
 //
-// TODO: the E5M3 patch open-codes this same scratch-SGPR reservation. Hoist
-// SgprScratchAlloc / tryAllocScratchSgpr / commitScratchSgpr into shared
-// infrastructure both patches call, rather than duplicating it.
-
 struct SgprScratchAlloc {
   unsigned Sgpr = 0;
   std::string KernelName;

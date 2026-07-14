@@ -891,7 +891,8 @@ struct SiteDeadSgprFunctionFacts {
 struct KernelTextRange {
   uint64_t Begin = 0;
   uint64_t End = 0;
-  std::vector<uint64_t> AdditionalEntries;
+  std::vector<uint64_t> Entries;
+  bool HasArbitraryIndirectIngress = false;
 };
 
 /// Forward must-analysis used by the gfx1250 initial-VMEM workaround. The
