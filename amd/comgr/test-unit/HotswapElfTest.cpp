@@ -1406,6 +1406,44 @@ TEST(ElfView, UpdateKernelMetadataSgprCountsKeepsPrimedCacheCoherent) {
   EXPECT_EQ(ViewOrErr->getKernelSgprCount("entry_kernel"), 10u);
 }
 
+TEST(ElfView, UpdateKernelMetadataSgprCountsBatchesMixedRequirements) {
+  comgr_test::KernelDescriptorElfOptions Opts;
+  Opts.MetadataKernels = {{"needs_update", 8}, {"already_enough", 16}};
+  comgr_test::KernelDescriptorElf Obj =
+      comgr_test::makeKernelDescriptorElf(makeText(), Opts);
+
+  llvm::Expected<ElfView> ViewOrErr =
+      ElfView::create(Obj.Bytes.data(), Obj.Bytes.size());
+  ASSERT_TRUE((bool)ViewOrErr) << llvm::toString(ViewOrErr.takeError());
+
+  llvm::StringMap<unsigned> RequiredSgprs;
+  RequiredSgprs.try_emplace("needs_update", 10u);
+  RequiredSgprs.try_emplace("already_enough", 12u);
+  ASSERT_TRUE(ViewOrErr->updateKernelMetadataSgprCounts(RequiredSgprs));
+  EXPECT_EQ(ViewOrErr->getKernelSgprCount("needs_update"), 10u);
+  EXPECT_EQ(ViewOrErr->getKernelSgprCount("already_enough"), 16u);
+}
+
+TEST(ElfView, UpdateKernelMetadataSgprCountsRejectsAbsentKernelAtomically) {
+  comgr_test::KernelDescriptorElfOptions Opts;
+  Opts.MetadataKernels = {{"needs_update", 8}, {"already_enough", 16}};
+  comgr_test::KernelDescriptorElf Obj =
+      comgr_test::makeKernelDescriptorElf(makeText(), Opts);
+
+  llvm::Expected<ElfView> ViewOrErr =
+      ElfView::create(Obj.Bytes.data(), Obj.Bytes.size());
+  ASSERT_TRUE((bool)ViewOrErr) << llvm::toString(ViewOrErr.takeError());
+
+  llvm::StringMap<unsigned> RequiredSgprs;
+  RequiredSgprs.try_emplace("needs_update", 10u);
+  RequiredSgprs.try_emplace("already_enough", 12u);
+  RequiredSgprs.try_emplace("absent_kernel", 4u);
+  EXPECT_FALSE(ViewOrErr->updateKernelMetadataSgprCounts(RequiredSgprs));
+  EXPECT_EQ(ViewOrErr->getKernelSgprCount("needs_update"), 8u);
+  EXPECT_EQ(ViewOrErr->getKernelSgprCount("already_enough"), 16u);
+  EXPECT_EQ(ViewOrErr->getKernelSgprCount("absent_kernel"), std::nullopt);
+}
+
 TEST(ElfView, UpdateKernelDescriptorSgprCountMetadataOnlyRequiresMetadata) {
   comgr_test::KernelDescriptorElfOptions Opts;
   Opts.KernelName = "entry_kernel";
