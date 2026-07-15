@@ -81,48 +81,95 @@ kernelEntryVAddr(const KernelDescriptorInfo &KD) {
   return KD.VAddr - Magnitude;
 }
 
-static std::vector<KernelTextRange> collectKernelTextRanges(
-    ElfView &Elf, const LLVMState &LS,
-    ArrayRef<std::pair<uint64_t, uint64_t>> OriginalControlFlowEdges) {
-  DenseSet<uint64_t> EntryVAddrs;
-  std::optional<uint64_t> TextEnd =
-      checkedAddUint64(Elf.textAddr(), Elf.textSize(), "kernel range text end");
-  if (!TextEnd)
-    return {};
+static std::optional<DenseSet<uint64_t>>
+collectResolvedKernelEntryOffsets(ElfView &Elf, const LLVMState &LS) {
+  if (!Elf.kernelDescriptorCacheIsComplete())
+    return std::nullopt;
 
+  std::optional<uint64_t> TextEnd =
+      checkedAddUint64(Elf.textAddr(), Elf.textSize(), "kernel entry text end");
+  if (!TextEnd)
+    return std::nullopt;
+
+  DenseSet<uint64_t> Result;
   for (const KernelDescriptorInfo &KD : Elf.kernelDescriptors()) {
     std::optional<uint64_t> Entry = kernelEntryVAddr(KD);
     if (!Entry)
-      continue;
+      return std::nullopt;
     if (*Entry >= Elf.textAddr() && *Entry < *TextEnd) {
-      EntryVAddrs.insert(*Entry);
+      Result.insert(*Entry - Elf.textAddr());
       continue;
     }
 
     const uint8_t *Stub = Elf.dataAtVAddr(*Entry, KernelEntryStubStride);
     if (!Stub)
-      continue;
+      return std::nullopt;
     std::optional<uint64_t> OriginalEntry = getKernelEntryTrampolineTargetVAddr(
         ArrayRef<uint8_t>(Stub, KernelEntryStubStride), *Entry, LS);
-    if (OriginalEntry && *OriginalEntry >= Elf.textAddr() &&
-        *OriginalEntry < *TextEnd)
-      EntryVAddrs.insert(*OriginalEntry);
+    if (!OriginalEntry || *OriginalEntry < Elf.textAddr() ||
+        *OriginalEntry >= *TextEnd)
+      return std::nullopt;
+    Result.insert(*OriginalEntry - Elf.textAddr());
   }
+  return Result;
+}
+
+static bool
+isExternallyVisibleCallable(const ElfView::FunctionTextRange &Range) {
+  if (!Range.Symbol || Range.Symbol->getBinding() == ELF::STB_LOCAL)
+    return false;
+  const unsigned Visibility = Range.Symbol->getVisibility();
+  return Visibility == ELF::STV_DEFAULT || Visibility == ELF::STV_PROTECTED;
+}
+
+static std::vector<KernelTextRange> collectKernelTextRanges(
+    ElfView &Elf, const LLVMState &LS,
+    ArrayRef<std::pair<uint64_t, uint64_t>> OriginalControlFlowEdges,
+    bool HasUnknownArbitraryIndirectTarget,
+    bool HasUnresolvedStandardLinkCall) {
+  std::optional<DenseSet<uint64_t>> EntryOffsets =
+      collectResolvedKernelEntryOffsets(Elf, LS);
+  if (!EntryOffsets)
+    return {};
 
   std::vector<KernelTextRange> Result;
-  for (const ElfView::FunctionTextRange &Range : Elf.functionTextRanges()) {
-    if (!EntryVAddrs.contains(Range.Begin) || Range.Begin < Elf.textAddr())
+  for (uint64_t Entry : *EntryOffsets) {
+    std::optional<ElfView::FunctionTextRange> Owner =
+        Elf.findFunctionTextRangeAtOffset(Entry);
+    if (!Owner || Owner->End <= Owner->Begin)
       continue;
-    KernelTextRange Candidate{Range.Begin - Elf.textAddr(),
-                              Range.End - Elf.textAddr()};
+    auto Existing = llvm::find_if(Result, [&](const KernelTextRange &Range) {
+      return Range.Begin == Owner->Begin && Range.End == Owner->End;
+    });
+    if (Existing == Result.end()) {
+      Result.push_back(
+          {Owner->Begin, Owner->End, {}, HasUnknownArbitraryIndirectTarget});
+      Existing = std::prev(Result.end());
+    }
+    if (!llvm::is_contained(Existing->Entries, Entry))
+      Existing->Entries.push_back(Entry);
+  }
+
+  for (KernelTextRange &Candidate : Result) {
     for (const auto &[Source, Target] : OriginalControlFlowEdges) {
       if (Target < Candidate.Begin || Target >= Candidate.End ||
           (Source >= Candidate.Begin && Source < Candidate.End))
         continue;
-      if (!llvm::is_contained(Candidate.AdditionalEntries, Target))
-        Candidate.AdditionalEntries.push_back(Target);
+      if (!llvm::is_contained(Candidate.Entries, Target))
+        Candidate.Entries.push_back(Target);
     }
-    Result.push_back(std::move(Candidate));
+    for (const ElfView::FunctionTextRange &Callable :
+         Elf.functionTextRanges()) {
+      if (Callable.Begin < Elf.textAddr() ||
+          (!HasUnresolvedStandardLinkCall &&
+           !isExternallyVisibleCallable(Callable)))
+        continue;
+      const uint64_t Entry = Callable.Begin - Elf.textAddr();
+      if (Entry >= Candidate.Begin && Entry < Candidate.End &&
+          !llvm::is_contained(Candidate.Entries, Entry))
+        Candidate.Entries.push_back(Entry);
+    }
+    llvm::sort(Candidate.Entries);
   }
   return Result;
 }
@@ -3401,7 +3448,22 @@ static std::optional<DenseSet<uint64_t>> collectDirectBranchTargets(
   // below, where an exact-start alias remains valid but an interior entry does
   // not.
   DenseSet<uint64_t> Targets = CodeEntries;
+  DenseSet<uint64_t> DecodedBoundaries;
+  for (const InternalDecodedInst &DI : Decoded)
+    DecodedBoundaries.insert(DI.Offset);
   for (const InternalDecodedInst &DI : Decoded) {
+    if (LS.MIA->isCall(DI.Inst)) {
+      std::optional<uint64_t> Continuation = checkedAddUint64(
+          DI.Offset, DI.Size, "call continuation control-flow target");
+      if (!Continuation || *Continuation >= Text.size() ||
+          !DecodedBoundaries.contains(*Continuation)) {
+        log() << "hotswap: call at 0x" << utohexstr(DI.Offset)
+              << " has no exact in-text continuation; source relocation and "
+                 "donated sleds are disabled\n";
+        return std::nullopt;
+      }
+      Targets.insert(*Continuation);
+    }
     if ((!LS.MIA->isBranch(DI.Inst) && !LS.MIA->isCall(DI.Inst)) ||
         LS.MIA->isIndirectBranch(DI.Inst) || LS.MIA->isReturn(DI.Inst))
       continue;
@@ -3614,6 +3676,303 @@ static bool isStandardLinkCall(const InternalDecodedInst &DI,
              "SGPR30_SGPR31";
 }
 
+static std::optional<std::pair<unsigned, SgprPairHalves>>
+getNumberedSgprPair(const LLVMState &LS, const MCOperand &Operand) {
+  if (!Operand.isReg() || !Operand.getReg())
+    return std::nullopt;
+  std::optional<SgprPairHalves> Halves =
+      getSgprPairHalves(LS, MCRegister(Operand.getReg()));
+  if (!Halves || Halves->IsVcc)
+    return std::nullopt;
+  std::optional<unsigned> Lo = numberedSgprIndex(*LS.MRI, Halves->Regs[0]);
+  std::optional<unsigned> Hi = numberedSgprIndex(*LS.MRI, Halves->Regs[1]);
+  if (!Lo || !Hi || *Hi != *Lo + 1)
+    return std::nullopt;
+  return std::make_pair(*Lo, *Halves);
+}
+
+static bool hasUnresolvedStandardLinkCall(
+    ArrayRef<InternalDecodedInst> Decoded, const LLVMState &LS,
+    const ElfView &Elf, const DenseSet<uint64_t> &DirectControlFlowTargets,
+    ArrayRef<uint8_t> Text, std::optional<ArrayRef<uint64_t>> TextSymbolOffsets,
+    std::optional<ArrayRef<ElfView::TextOffsetRange>> TextSymbolExtents) {
+  for (size_t I = 0; I != Decoded.size(); ++I) {
+    if (!isStandardLinkCall(Decoded[I], LS))
+      continue;
+    if (!evaluateMaterializedPcTransfer(Decoded, I, DirectControlFlowTargets,
+                                        Text, LS, Elf, TextSymbolOffsets,
+                                        TextSymbolExtents))
+      return true;
+  }
+  return false;
+}
+
+/// Prove nonstandard s_set_pc_i64 returns only when every modeled ingress
+/// carries the exact link written by an in-text s_call_i64 using the same
+/// physical SGPR pair. Any alternate entry, clobber, or unmodeled indirect
+/// transfer invalidates the proof globally.
+static DenseSet<uint64_t> collectProvenDirectCallReturns(
+    ArrayRef<InternalDecodedInst> Decoded, const LLVMState &LS, ElfView &Elf,
+    const DenseSet<uint64_t> &DirectControlFlowTargets, ArrayRef<uint8_t> Text,
+    std::optional<ArrayRef<uint64_t>> TextSymbolOffsets,
+    std::optional<ArrayRef<ElfView::TextOffsetRange>> TextSymbolExtents,
+    bool HasUnresolvedStandardLinkCall) {
+  DenseSet<uint64_t> Proven;
+  if (!LS.MIA || !LS.MCII || !LS.MRI || Decoded.empty())
+    return Proven;
+
+  // AMDGPU's instruction metadata does not classify RFE as a branch or a
+  // terminator. It can nevertheless resume at an arbitrary PC with arbitrary
+  // SGPR contents. An undecodable word may hide the same behavior, so no
+  // nonstandard link-pair proof survives either condition.
+  if (llvm::any_of(Decoded, [&](const InternalDecodedInst &DI) {
+        return DI.Mnemonic == "<unknown>" ||
+               StringRef(DI.Mnemonic).starts_with("s_rfe");
+      }))
+    return Proven;
+
+  DenseMap<uint64_t, unsigned> OffsetToIndex;
+  OffsetToIndex.reserve(Decoded.size());
+  for (unsigned I = 0; I != Decoded.size(); ++I) {
+    if (Decoded[I].Size == 0 ||
+        !OffsetToIndex.try_emplace(Decoded[I].Offset, I).second)
+      return {};
+  }
+
+  std::vector<std::optional<MaterializedPcTransfer>> Materialized(
+      Decoded.size());
+  for (size_t I = 0; I != Decoded.size(); ++I)
+    Materialized[I] = evaluateMaterializedPcTransfer(
+        Decoded, I, DirectControlFlowTargets, Text, LS, Elf, TextSymbolOffsets,
+        TextSymbolExtents);
+
+  std::vector<std::optional<unsigned>> ReturnPairs(Decoded.size());
+  SmallVector<std::pair<unsigned, SgprPairHalves>, 4> Pairs;
+  for (unsigned I = 0; I != Decoded.size(); ++I) {
+    const InternalDecodedInst &DI = Decoded[I];
+    if (DI.Inst.getOpcode() != LS.SSetPcI64Opcode ||
+        isStandardLinkReturn(DI, LS) || Materialized[I] ||
+        DI.Inst.getNumOperands() != 1)
+      continue;
+    std::optional<std::pair<unsigned, SgprPairHalves>> Pair =
+        getNumberedSgprPair(LS, DI.Inst.getOperand(0));
+    if (!Pair)
+      continue;
+    ReturnPairs[I] = Pair->first;
+    if (!llvm::any_of(Pairs, [&](const auto &Existing) {
+          return Existing.first == Pair->first;
+        }))
+      Pairs.push_back(*Pair);
+  }
+  if (Pairs.empty())
+    return Proven;
+
+  std::optional<DenseSet<uint64_t>> DescriptorEntries =
+      collectResolvedKernelEntryOffsets(Elf, LS);
+  if (!DescriptorEntries)
+    return Proven;
+  SmallVector<unsigned, 8> DescriptorEntryIndices;
+  for (uint64_t Entry : *DescriptorEntries) {
+    auto It = OffsetToIndex.find(Entry);
+    if (It == OffsetToIndex.end())
+      return {};
+    DescriptorEntryIndices.push_back(It->second);
+  }
+
+  SmallVector<unsigned, 16> CallableEntryIndices;
+  for (const ElfView::FunctionTextRange &Range : Elf.functionTextRanges()) {
+    if (Range.Begin < Elf.textAddr() ||
+        (!HasUnresolvedStandardLinkCall && !isExternallyVisibleCallable(Range)))
+      continue;
+    const uint64_t Entry = Range.Begin - Elf.textAddr();
+    if (Entry >= Text.size())
+      continue;
+    auto It = OffsetToIndex.find(Entry);
+    if (It == OffsetToIndex.end())
+      return {};
+    if (!llvm::is_contained(CallableEntryIndices, It->second))
+      CallableEntryIndices.push_back(It->second);
+  }
+
+  struct CallIngress {
+    unsigned TargetIndex = 0;
+    std::optional<unsigned> ExactLinkPair;
+  };
+  SmallVector<unsigned, 16> CallContinuationIndices;
+  SmallVector<CallIngress, 16> CallIngresses;
+  for (unsigned I = 0; I != Decoded.size(); ++I) {
+    const InternalDecodedInst &DI = Decoded[I];
+    if (!LS.MIA->isCall(DI.Inst))
+      continue;
+
+    std::optional<uint64_t> Continuation = checkedAddUint64(
+        DI.Offset, DI.Size, "direct-call return proof continuation");
+    if (!Continuation || *Continuation >= Text.size())
+      return {};
+    auto ContinuationIt = OffsetToIndex.find(*Continuation);
+    if (ContinuationIt == OffsetToIndex.end())
+      return {};
+    if (!llvm::is_contained(CallContinuationIndices, ContinuationIt->second))
+      CallContinuationIndices.push_back(ContinuationIt->second);
+
+    std::optional<uint64_t> Target;
+    std::optional<unsigned> ExactPair;
+    if (DI.Inst.getOpcode() == LS.SCallI64Opcode) {
+      Target = evaluateDirectControlFlowTarget(DI, LS);
+      if (!Target)
+        return {};
+      if (DI.Inst.getNumOperands() == 2)
+        if (std::optional<std::pair<unsigned, SgprPairHalves>> Pair =
+                getNumberedSgprPair(LS, DI.Inst.getOperand(0)))
+          ExactPair = Pair->first;
+    } else if (Materialized[I]) {
+      Target = Materialized[I]->Target;
+    } else if (!LS.MIA->isIndirectBranch(DI.Inst)) {
+      Target = evaluateDirectControlFlowTarget(DI, LS);
+      if (!Target)
+        return {};
+    }
+    if (!Target || *Target >= Text.size())
+      continue;
+    auto TargetIt = OffsetToIndex.find(*Target);
+    if (TargetIt == OffsetToIndex.end())
+      return {};
+    CallIngresses.push_back({TargetIt->second, ExactPair});
+  }
+
+  std::vector<SmallVector<unsigned, 2>> Successors(Decoded.size());
+  auto AddFallthrough = [&](unsigned I) {
+    std::optional<uint64_t> Next =
+        checkedAddUint64(Decoded[I].Offset, Decoded[I].Size,
+                         "direct-call return proof fallthrough");
+    if (!Next || *Next >= Text.size() || I + 1 >= Decoded.size() ||
+        Decoded[I + 1].Offset != *Next)
+      return false;
+    Successors[I].push_back(I + 1);
+    return true;
+  };
+  auto AddTarget = [&](unsigned I, uint64_t Target) {
+    if (Target >= Text.size())
+      return true;
+    auto It = OffsetToIndex.find(Target);
+    if (It == OffsetToIndex.end())
+      return false;
+    Successors[I].push_back(It->second);
+    return true;
+  };
+
+  for (unsigned I = 0; I != Decoded.size(); ++I) {
+    const InternalDecodedInst &DI = Decoded[I];
+    const MCInstrDesc &Desc = LS.MCII->get(DI.Inst.getOpcode());
+    if (LS.MIA->isCall(DI.Inst) || DI.Mnemonic == "s_code_end" ||
+        DI.Mnemonic == "s_endpgm" || DI.Mnemonic == "s_endpgm_saved" ||
+        LS.MIA->isReturn(DI.Inst))
+      continue;
+    if (Materialized[I]) {
+      if (!AddTarget(I, Materialized[I]->Target))
+        return {};
+      continue;
+    }
+    if (DI.Inst.getOpcode() == LS.SSetPcI64Opcode)
+      continue;
+    if (LS.MIA->isBranch(DI.Inst)) {
+      if (LS.MIA->isIndirectBranch(DI.Inst))
+        continue;
+      std::optional<uint64_t> Target = evaluateDirectControlFlowTarget(DI, LS);
+      if (!Target || !AddTarget(I, *Target))
+        return {};
+      if (LS.MIA->isConditionalBranch(DI.Inst)) {
+        if (!AddFallthrough(I))
+          return {};
+      } else if (!LS.MIA->isUnconditionalBranch(DI.Inst)) {
+        return {};
+      }
+      continue;
+    }
+    if (StringRef(DI.Mnemonic).starts_with("s_trap") || Desc.isTrap()) {
+      if (!AddFallthrough(I))
+        return {};
+      continue;
+    }
+    if (Desc.isTerminator() || LS.MIA->mayAffectControlFlow(DI.Inst, *LS.MRI))
+      return {};
+    if (!AddFallthrough(I))
+      return {};
+  }
+
+  constexpr uint8_t ExactDirectCallLink = 1;
+  constexpr uint8_t UnknownLink = 2;
+  for (const auto &[PairBase, PairHalves] : Pairs) {
+    SmallVector<uint8_t> In(Decoded.size(), 0);
+    SmallVector<unsigned, 64> Worklist;
+    auto Merge = [&](unsigned Index, uint8_t State) {
+      const uint8_t Merged = In[Index] | State;
+      if (Merged == In[Index])
+        return;
+      In[Index] = Merged;
+      Worklist.push_back(Index);
+    };
+
+    for (unsigned Entry : DescriptorEntryIndices)
+      Merge(Entry, UnknownLink);
+    for (unsigned Entry : CallableEntryIndices)
+      Merge(Entry, UnknownLink);
+    for (unsigned Continuation : CallContinuationIndices)
+      Merge(Continuation, UnknownLink);
+    for (const CallIngress &Ingress : CallIngresses)
+      Merge(Ingress.TargetIndex,
+            Ingress.ExactLinkPair && *Ingress.ExactLinkPair == PairBase
+                ? ExactDirectCallLink
+                : UnknownLink);
+
+    for (size_t Next = 0; Next != Worklist.size(); ++Next) {
+      const unsigned I = Worklist[Next];
+      const InternalDecodedInst &DI = Decoded[I];
+      if (ReturnPairs[I] && *ReturnPairs[I] == PairBase) {
+        if (In[I] == ExactDirectCallLink)
+          Proven.insert(DI.Offset);
+        else
+          Proven.erase(DI.Offset);
+        continue;
+      }
+
+      uint8_t Out = In[I];
+      const MCInstrDesc &Desc = LS.MCII->get(DI.Inst.getOpcode());
+      if (DI.Mnemonic == "<unknown>" ||
+          StringRef(DI.Mnemonic).starts_with("s_trap") || Desc.isTrap()) {
+        Out = UnknownLink;
+      } else if (Out != 0) {
+        std::optional<RegisterPairAccess> Access = getRegisterPairAccess(
+            LS, DI, PairHalves.Regs, /*PairIsAbiVcc=*/false);
+        if (!Access || Access->Defs != 0)
+          Out = UnknownLink;
+      }
+      for (unsigned Succ : Successors[I])
+        Merge(Succ, Out);
+    }
+  }
+
+  // A genuinely arbitrary transfer can enter any instruction with an unknown
+  // link value, invalidating every otherwise-local direct-return proof.
+  for (size_t I = 0; I != Decoded.size(); ++I) {
+    const InternalDecodedInst &DI = Decoded[I];
+    if (DI.Mnemonic == "s_endpgm" || DI.Mnemonic == "s_endpgm_saved")
+      continue;
+    const bool HasOpaqueControlFlow =
+        DI.Mnemonic == "<unknown>" ||
+        StringRef(DI.Mnemonic).starts_with("s_rfe");
+    if (!HasOpaqueControlFlow && !LS.MIA->isIndirectBranch(DI.Inst) &&
+        !(LS.MIA->mayAffectControlFlow(DI.Inst, *LS.MRI) &&
+          StringRef(DI.Mnemonic).contains("_pc_")))
+      continue;
+    if (isStandardLinkReturn(DI, LS) || Materialized[I] ||
+        isStandardLinkCall(DI, LS) || Proven.contains(DI.Offset))
+      continue;
+    return {};
+  }
+  return Proven;
+}
+
 /// Relocating an instruction changes its address. In a function containing a
 /// register-based PC transfer, MC cannot prove that the instruction is not an
 /// indirect destination, so leave the complete function in place.
@@ -3622,6 +3981,7 @@ static DenseSet<uint64_t> collectIndirectControlFlowFunctions(
     const ElfView &Elf, const DenseSet<uint64_t> &DirectControlFlowTargets,
     ArrayRef<uint8_t> Text, std::optional<ArrayRef<uint64_t>> TextSymbolOffsets,
     std::optional<ArrayRef<ElfView::TextOffsetRange>> TextSymbolExtents,
+    const DenseSet<uint64_t> &ProvenDirectCallReturns,
     bool &HasUnknownArbitraryIndirectTarget) {
   DenseSet<uint64_t> Functions;
   HasUnknownArbitraryIndirectTarget = false;
@@ -3632,7 +3992,10 @@ static DenseSet<uint64_t> collectIndirectControlFlowFunctions(
     const InternalDecodedInst &DI = Decoded[I];
     if (DI.Mnemonic == "s_endpgm" || DI.Mnemonic == "s_endpgm_saved")
       continue;
-    if (!LS.MIA->isIndirectBranch(DI.Inst) &&
+    const bool HasOpaqueControlFlow =
+        DI.Mnemonic == "<unknown>" ||
+        StringRef(DI.Mnemonic).starts_with("s_rfe");
+    if (!HasOpaqueControlFlow && !LS.MIA->isIndirectBranch(DI.Inst) &&
         !(LS.MIA->mayAffectControlFlow(DI.Inst, *LS.MRI) &&
           StringRef(DI.Mnemonic).contains("_pc_")))
       continue;
@@ -3648,6 +4011,11 @@ static DenseSet<uint64_t> collectIndirectControlFlowFunctions(
     // arbitrary code padding.
     if (IsSetPc && UsesStandardLinkPair)
       continue;
+    if (IsSetPc && ProvenDirectCallReturns.contains(DI.Offset)) {
+      log() << "hotswap: recognized proven direct-call return at 0x"
+            << utohexstr(DI.Offset) << "\n";
+      continue;
+    }
     if (std::optional<MaterializedPcTransfer> Transfer =
             evaluateMaterializedPcTransfer(Decoded, I, DirectControlFlowTargets,
                                            Text, LS, Elf, TextSymbolOffsets,
@@ -4826,18 +5194,35 @@ static std::optional<uint32_t> applyGfx1250B0toA0Rules(
   DenseSet<uint64_t> EmptyTargets;
   const DenseSet<uint64_t> &KnownDirectTargets =
       DirectControlFlowTargets ? *DirectControlFlowTargets : EmptyTargets;
+  const std::optional<ArrayRef<uint64_t>> OptionalTextSymbolOffsets =
+      TextSymbolOffsets ? std::optional<ArrayRef<uint64_t>>(*TextSymbolOffsets)
+                        : std::nullopt;
+  const std::optional<ArrayRef<ElfView::TextOffsetRange>>
+      OptionalTextSymbolExtents =
+          TextSymbolExtents ? std::optional<ArrayRef<ElfView::TextOffsetRange>>(
+                                  *TextSymbolExtents)
+                            : std::nullopt;
+  const ArrayRef<uint8_t> TextBytes(Text, TextSize);
+  const bool HasUnresolvedStandardLinkCall =
+      DirectControlFlowTargets
+          ? hasUnresolvedStandardLinkCall(Decoded, LS, Elf, KnownDirectTargets,
+                                          TextBytes, OptionalTextSymbolOffsets,
+                                          OptionalTextSymbolExtents)
+          : llvm::any_of(Decoded, [&](const InternalDecodedInst &DI) {
+              return isStandardLinkCall(DI, LS);
+            });
+  DenseSet<uint64_t> ProvenDirectCallReturns;
+  if (DirectControlFlowTargets && TextSymbolOffsets && TextSymbolExtents)
+    ProvenDirectCallReturns = collectProvenDirectCallReturns(
+        Decoded, LS, Elf, KnownDirectTargets, TextBytes,
+        OptionalTextSymbolOffsets, OptionalTextSymbolExtents,
+        HasUnresolvedStandardLinkCall);
   bool HasUnknownArbitraryIndirectTarget = false;
   DenseSet<uint64_t> IndirectControlFlowFunctions =
       collectIndirectControlFlowFunctions(
-          Decoded, LS, Elf, KnownDirectTargets,
-          ArrayRef<uint8_t>(Text, TextSize),
-          TextSymbolOffsets
-              ? std::optional<ArrayRef<uint64_t>>(*TextSymbolOffsets)
-              : std::nullopt,
-          TextSymbolExtents ? std::optional<ArrayRef<ElfView::TextOffsetRange>>(
-                                  *TextSymbolExtents)
-                            : std::nullopt,
-          HasUnknownArbitraryIndirectTarget);
+          Decoded, LS, Elf, KnownDirectTargets, TextBytes,
+          OptionalTextSymbolOffsets, OptionalTextSymbolExtents,
+          ProvenDirectCallReturns, HasUnknownArbitraryIndirectTarget);
   if (!DirectControlFlowTargets)
     for (const ElfView::FunctionTextRange &Range : Elf.functionTextRanges())
       if (Range.Begin >= Elf.textAddr())
@@ -4874,10 +5259,6 @@ static std::optional<uint32_t> applyGfx1250B0toA0Rules(
 
   TensorDescriptorMustAnalysis TensorDescriptorAnalysis;
   InitialVmemMustAnalysis InitialVmemAnalysis;
-  const bool HasUnresolvedStandardLinkCall =
-      llvm::any_of(Decoded, [&](const InternalDecodedInst &DI) {
-        return isStandardLinkCall(DI, LS);
-      });
   const bool HasClause =
       Config.RunB0A0Patches &&
       llvm::any_of(Decoded, [](const InternalDecodedInst &DI) {
@@ -4902,8 +5283,9 @@ static std::optional<uint32_t> applyGfx1250B0toA0Rules(
                                 *TextSymbolExtents)
                           : std::nullopt);
   if (HasClause) {
-    std::vector<KernelTextRange> KernelRanges =
-        collectKernelTextRanges(Elf, LS, OriginalIngress.ControlFlowEdges);
+    std::vector<KernelTextRange> KernelRanges = collectKernelTextRanges(
+        Elf, LS, OriginalIngress.ControlFlowEdges,
+        HasUnknownArbitraryIndirectTarget, HasUnresolvedStandardLinkCall);
     InitialVmemAnalysis = computeInitialVmemMustAnalysis(
         Decoded, HotswapAnalysisDecoded, KernelRanges, LS);
   }
@@ -4916,6 +5298,7 @@ static std::optional<uint32_t> applyGfx1250B0toA0Rules(
     const bool TensorHasTrapOrRfe =
         llvm::any_of(Decoded, [&](const InternalDecodedInst &DI) {
           return StringRef(DI.Mnemonic).starts_with("s_rfe") ||
+                 StringRef(DI.Mnemonic).starts_with("s_trap") ||
                  (LS.MCII && LS.MCII->get(DI.Inst.getOpcode()).isTrap());
         });
     std::vector<TensorAnalysisRange> TensorRanges;
